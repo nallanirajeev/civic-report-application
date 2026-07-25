@@ -1016,8 +1016,14 @@
   }
 
   // ---------- Shared store (restdb.io — visible to every visitor, not just this browser) ----------
+  let lastRestdbError = '';
+  async function restdbErrorText(res){
+    try{ const body = await res.text(); return res.status + ' ' + (body ? body.slice(0, 200) : res.statusText); }
+    catch(e){ return String(res.status); }
+  }
+
   async function fetchShared(){
-    if(!RESTDB_CONFIGURED) return [];
+    if(!RESTDB_CONFIGURED){ lastRestdbError = 'not configured'; return []; }
     try{
       let doc = null;
       if(sharedDocId){
@@ -1029,11 +1035,12 @@
       sharedDocId = doc._id;
       return Array.isArray(doc.tickets) ? doc.tickets : [];
     }catch(e){
+      lastRestdbError = (e && e.message) ? e.message : String(e);
       return [];
     }
   }
   async function writeShared(list){
-    if(!RESTDB_CONFIGURED) return false;
+    if(!RESTDB_CONFIGURED){ lastRestdbError = 'not configured'; return false; }
     try{
       if(!sharedDocId){
         const existing = await restdbFindStoreDoc();
@@ -1045,6 +1052,7 @@
           headers: restdbHeaders,
           body: JSON.stringify({ storeKey: RESTDB_STORE_KEY, tickets: list })
         });
+        if(!res.ok) lastRestdbError = await restdbErrorText(res);
         return res.ok;
       }
       const res = await fetch(RESTDB_BASE_URL, {
@@ -1052,11 +1060,12 @@
         headers: restdbHeaders,
         body: JSON.stringify({ storeKey: RESTDB_STORE_KEY, tickets: list })
       });
-      if(!res.ok) return false;
+      if(!res.ok){ lastRestdbError = await restdbErrorText(res); return false; }
       const created = await res.json();
       sharedDocId = created._id;
       return true;
     }catch(e){
+      lastRestdbError = (e && e.message) ? e.message : String(e);
       return false;
     }
   }
@@ -1340,7 +1349,7 @@
     const ok = await writeShared(list);
     if(ok) reports = list;
 
-    toast(ok ? 'Filed ' + ticketId(nextNum) : 'Could not file — check your connection and try again');
+    toast(ok ? 'Filed ' + ticketId(nextNum) : 'Could not file — ' + (lastRestdbError || 'check your connection and try again'));
 
     if(ok){
       // reset form only on success — keep the user's input if the save failed
@@ -1444,277 +1453,4 @@
         actions = '<select class="status-select" data-id="'+r.id+'" aria-label="Change status for '+ticketId(r.num)+'">'
           + STEPS.map(s=>'<option value="'+s+'"'+(s===r.status?' selected':'')+'>'+s+'</option>').join('')
           + '</select>'
-          + '<button class="danger" data-id="'+r.id+'" data-action="delete">Delete</button>';
-      } else {
-        const upvoted = Array.isArray(r.upvotes) && r.upvotes.indexOf(myId) !== -1;
-        const count = Array.isArray(r.upvotes) ? r.upvotes.length : 0;
-        actions = '<button class="upvote-btn'+(upvoted?' active':'')+'" data-id="'+r.id+'" data-action="upvote" aria-pressed="'+upvoted+'" aria-label="Upvote '+ticketId(r.num)+'">&#9829; <span>'+count+'</span></button>';
-      }
-
-      let reviewHtml = '';
-      if(isOwner && r.status === 'Resolved' && !r.confirmedResolved){
-        reviewHtml = '<div class="review-panel">'
-          + '<p>Was this actually fixed?</p>'
-          + '<div class="review-actions">'
-          + '<button type="button" class="btn-mini yes" data-id="'+r.id+'" data-action="confirm-fixed">Yes, fixed</button>'
-          + '<button type="button" class="btn-mini no" data-id="'+r.id+'" data-action="reopen">No, reopen</button>'
-          + '</div></div>';
-      }
-
-      return '<div class="ticket-pin" style="--rot: '+rot+'deg">'
-        + '<span class="pin-head" aria-hidden="true"></span>'
-        + '<div class="ticket">'
-        + '<div class="ticket-stub"><span class="glyph" aria-hidden="true">'+ (glyphs[r.category]||fallbackGlyph) +'</span><span class="id">'+ ticketId(r.num) +'</span></div>'
-        + '<div class="ticket-body">'
-        + '<div class="stamp '+statusClass(r.status)+'">'+r.status+'</div>'
-        + '<h3>'+escapeHtml(r.category)+'</h3>'
-        + renderProgressTrack(r.status)
-        + photoHtml
-        + '<div class="desc">'+escapeHtml(r.description)+'</div>'
-        + '<div class="meta">'+metaHtml+'</div>'
-        + reviewHtml
-        + '<div class="ticket-actions">'+actions+'</div>'
-        + '</div></div></div>';
-    }).join('') + '</div></div>';
-
-    container.querySelectorAll('button[data-action]').forEach(btn=>{
-      btn.addEventListener('click', async ()=>{
-        const id = btn.dataset.id;
-        const action = btn.dataset.action;
-        if(action === 'delete') await deleteTicket(id);
-        if(action === 'upvote') await toggleUpvote(id);
-        if(action === 'confirm-fixed') await confirmResolved(id);
-        if(action === 'reopen') await reopenTicket(id);
-      });
-    });
-    container.querySelectorAll('select.status-select').forEach(sel=>{
-      sel.addEventListener('change', async ()=>{
-        await setStatus(sel.dataset.id, sel.value);
-      });
-    });
-  }
-
-  // ---------- Previous reports (Report view) ----------
-  function renderPreviousReports(){
-    const panel = document.getElementById('previousReportsPanel');
-    if(!panel) return;
-    const mine = reports.filter(r=>r.reporterId === myId);
-    if(mine.length === 0){
-      panel.innerHTML = '<div class="prev-card"><h3>Your previous reports</h3>'
-        + '<p class="empty-copy">You haven\'t filed anything yet. Be the first in your block.</p></div>';
-      return;
-    }
-    panel.innerHTML = '<div class="prev-card"><h3>Your previous reports</h3><div class="prev-list">'
-      + mine.map(r=>{
-        return '<div class="prev-row">'
-          + '<span class="prev-id">'+ticketId(r.num)+'</span>'
-          + '<span class="prev-cat">'+escapeHtml(r.category)+'</span>'
-          + '<span class="prev-status status-'+statusClass(r.status)+'">'+r.status+'</span>'
-          + '<span class="prev-age">'+timeAgo(r.createdAt)+'</span>'
-          + '<span class="prev-actions">'
-          + '<button type="button" data-action="view-board" data-id="'+r.id+'">View</button>'
-          + '<button type="button" class="danger" data-action="delete" data-id="'+r.id+'">Delete</button>'
-          + '</span></div>';
-      }).join('')
-      + '</div></div>';
-    panel.querySelectorAll('button[data-action]').forEach(btn=>{
-      btn.addEventListener('click', async ()=>{
-        const action = btn.dataset.action;
-        if(action === 'view-board') document.getElementById('tab-board').click();
-        if(action === 'delete') await deleteTicket(btn.dataset.id);
-      });
-    });
-  }
-
-  function escapeHtml(str){
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
-  }
-
-  // ---------- Map ----------
-  function renderMap(){
-    const withLoc = reports.filter(r=>r.loc);
-    const emptyEl = document.getElementById('mapEmpty');
-    if(emptyEl) emptyEl.hidden = reports.length > 0;
-    if(!map){
-      const center = withLoc.length ? [withLoc[0].loc.lat, withLoc[0].loc.lng] : [20, 0];
-      map = L.map('map').setView(center, withLoc.length ? 14 : 2);
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '&copy; OpenStreetMap contributors',
-        maxZoom: 19
-      }).addTo(map);
-      markerLayer = L.layerGroup().addTo(map);
-    }
-    markerLayer.clearLayers();
-    const colors = { 'Pending':'#A93B3B', 'In Progress':'#F7B733', 'Resolved':'#2D6A4F' };
-    withLoc.forEach(r=>{
-      const marker = L.circleMarker([r.loc.lat, r.loc.lng], {
-        radius: 9, color: '#1E1E1C', weight: 1.5, fillColor: colors[r.status], fillOpacity: 0.9
-      });
-      marker.bindPopup(
-        '<strong>'+ ticketId(r.num) +' — '+escapeHtml(r.category)+'</strong><br>'
-        + escapeHtml(r.description) + '<br>'
-        + '<em>'+r.status+'</em>'
-      );
-      marker.addTo(markerLayer);
-    });
-    if(withLoc.length){
-      const group = new L.featureGroup(markerLayer.getLayers());
-      if(withLoc.length > 1) map.fitBounds(group.getBounds().pad(0.3));
-    }
-  }
-
-  // ---------- Init + real-time polling ----------
-  await ensureIdentity();
-  if(!RESTDB_CONFIGURED){
-    toast('restdb.io not configured — add your database URL + API key in the script');
-  }
-  await syncFromStore();
-  renderPreviousReports();
-  setInterval(syncFromStore, 5000);
-})();
-</script>
-
-<!-- Scroll-driven frame-sequence animation: fully isolated, does not touch the app script above.
-     Frames are the ones provided directly (assets/frames/ezgif-frame-XXX.jpg) — used as-is,
-     pre-decoded so each scroll step is an instant full-screen canvas draw, no video seek lag. -->
-<script>
-(function(){
-  'use strict';
-
-  const wrap = document.getElementById('scrollVideoWrap');
-  const pin = document.getElementById('scrollVideoPin');
-  const canvas = document.getElementById('scrollCanvas');
-  const bar = document.getElementById('scrollVideoBar');
-  const hint = document.getElementById('scrollVideoHint');
-  const loading = document.getElementById('scrollLoading');
-  const loadingFill = document.getElementById('scrollLoadingFill');
-  const loadingLabel = document.getElementById('scrollLoadingLabel');
-  const animTabBtn = document.getElementById('tab-animation');
-  if(!wrap || !pin || !canvas) return;
-
-  const FRAME_COUNT = 300;
-  const FRAME_PATH = function(i){
-    return 'assets/frames/ezgif-frame-' + String(i).padStart(3, '0') + '.jpg';
-  };
-
-  const ctx = canvas.getContext('2d');
-  const frames = new Array(FRAME_COUNT);
-  let loadedCount = 0;
-  let ready = false;       // true once every frame image has loaded
-  let ticking = false;     // rAF guard — only one queued update at a time, prevents race conditions
-  let destroyed = false;
-  let lastDrawnIndex = -1;
-  let dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
-
-  function sizeCanvas(){
-    canvas.width = Math.round(window.innerWidth * dpr);
-    canvas.height = Math.round(window.innerHeight * dpr);
-  }
-
-  function drawFrame(index){
-    const img = frames[index];
-    if(!img || !img.complete || img.naturalWidth === 0) return;
-    const cw = canvas.width, ch = canvas.height;
-    const iw = img.naturalWidth, ih = img.naturalHeight;
-    // object-fit: cover math — always fills the full viewport edge-to-edge, cropping overflow
-    const scale = Math.max(cw / iw, ch / ih);
-    const dw = iw * scale, dh = ih * scale;
-    const dx = (cw - dw) / 2, dy = (ch - dh) / 2;
-    ctx.clearRect(0, 0, cw, ch);
-    ctx.drawImage(img, dx, dy, dw, dh);
-    lastDrawnIndex = index;
-  }
-
-  // ---- Pinning: the layer is always `position: fixed` (see CSS) and is simply shown/hidden
-  // via opacity while the wrap is scrolled through. Never toggling `position` itself is what
-  // avoids the layout-recalculation glitch that showed up right at the start/end boundaries.
-  function updatePin(){
-    const rect = wrap.getBoundingClientRect();
-    const vh = window.innerHeight;
-    const active = rect.top <= 0 && rect.bottom >= vh;
-    pin.classList.toggle('is-active', active);
-  }
-
-  function currentProgress(){
-    const rect = wrap.getBoundingClientRect();
-    const scrollable = wrap.offsetHeight - window.innerHeight;
-    if(scrollable <= 0) return 0;
-    const scrolled = -rect.top;
-    return Math.min(1, Math.max(0, scrolled / scrollable));
-  }
-
-  function update(){
-    ticking = false;
-    if(destroyed) return;
-
-    updatePin();
-    if(!ready) return;
-
-    const progress = currentProgress();
-    const index = Math.min(FRAME_COUNT - 1, Math.round(progress * (FRAME_COUNT - 1)));
-
-    if(index !== lastDrawnIndex) drawFrame(index);
-    if(bar) bar.style.width = (progress * 100).toFixed(2) + '%';
-    if(hint) hint.classList.toggle('hidden', progress > 0.03);
-  }
-
-  function requestUpdate(){
-    if(ticking) return; // frame already queued — never stack two, this is what keeps it race-free
-    ticking = true;
-    requestAnimationFrame(update);
-  }
-
-  function onResize(){
-    dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
-    sizeCanvas();
-    lastDrawnIndex = -1; // force a redraw at the new size
-    requestUpdate();
-  }
-
-  function preload(){
-    sizeCanvas();
-    for(let i = 1; i <= FRAME_COUNT; i++){
-      const img = new Image();
-      img.onload = img.onerror = function(){
-        loadedCount++;
-        const pct = Math.round((loadedCount / FRAME_COUNT) * 100);
-        if(loadingFill) loadingFill.style.width = pct + '%';
-        if(loadingLabel) loadingLabel.textContent = 'Loading ' + pct + '%';
-
-        // Paint the very first frame the moment it's available so there's no blank screen.
-        if(i === 1 && img.complete && img.naturalWidth > 0) drawFrame(0);
-
-        if(loadedCount === FRAME_COUNT){
-          ready = true;
-          canvas.classList.add('ready');
-          if(loading) loading.classList.add('hidden');
-          update();
-        }
-      };
-      img.src = FRAME_PATH(i);
-      frames[i - 1] = img;
-    }
-  }
-
-  preload();
-  updatePin();
-
-  window.addEventListener('scroll', requestUpdate, { passive: true });
-  window.addEventListener('resize', onResize, { passive: true });
-
-  // The section is `display:none` while inactive, so its layout height is 0 —
-  // recompute right after the user switches into this tab via the nav bar.
-  if(animTabBtn){
-    animTabBtn.addEventListener('click', function(){
-      setTimeout(function(){ sizeCanvas(); lastDrawnIndex = -1; requestUpdate(); }, 60);
-    });
-  }
-
-  window.addEventListener('beforeunload', function(){ destroyed = true; });
-})();
-</script>
-
-</body>
-</html>
+          + '<button class="danger" data-id="'
