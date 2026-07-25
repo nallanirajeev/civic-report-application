@@ -1016,14 +1016,8 @@
   }
 
   // ---------- Shared store (restdb.io — visible to every visitor, not just this browser) ----------
-  let lastRestdbError = '';
-  async function restdbErrorText(res){
-    try{ const body = await res.text(); return res.status + ' ' + (body ? body.slice(0, 200) : res.statusText); }
-    catch(e){ return String(res.status); }
-  }
-
   async function fetchShared(){
-    if(!RESTDB_CONFIGURED){ lastRestdbError = 'not configured'; return []; }
+    if(!RESTDB_CONFIGURED) return [];
     try{
       let doc = null;
       if(sharedDocId){
@@ -1035,12 +1029,11 @@
       sharedDocId = doc._id;
       return Array.isArray(doc.tickets) ? doc.tickets : [];
     }catch(e){
-      lastRestdbError = (e && e.message) ? e.message : String(e);
       return [];
     }
   }
   async function writeShared(list){
-    if(!RESTDB_CONFIGURED){ lastRestdbError = 'not configured'; return false; }
+    if(!RESTDB_CONFIGURED) return false;
     try{
       if(!sharedDocId){
         const existing = await restdbFindStoreDoc();
@@ -1052,7 +1045,6 @@
           headers: restdbHeaders,
           body: JSON.stringify({ storeKey: RESTDB_STORE_KEY, tickets: list })
         });
-        if(!res.ok) lastRestdbError = await restdbErrorText(res);
         return res.ok;
       }
       const res = await fetch(RESTDB_BASE_URL, {
@@ -1060,12 +1052,11 @@
         headers: restdbHeaders,
         body: JSON.stringify({ storeKey: RESTDB_STORE_KEY, tickets: list })
       });
-      if(!res.ok){ lastRestdbError = await restdbErrorText(res); return false; }
+      if(!res.ok) return false;
       const created = await res.json();
       sharedDocId = created._id;
       return true;
     }catch(e){
-      lastRestdbError = (e && e.message) ? e.message : String(e);
       return false;
     }
   }
@@ -1349,7 +1340,7 @@
     const ok = await writeShared(list);
     if(ok) reports = list;
 
-    toast(ok ? 'Filed ' + ticketId(nextNum) : 'Could not file — ' + (lastRestdbError || 'check your connection and try again'));
+    toast(ok ? 'Filed ' + ticketId(nextNum) : 'Could not file — check your connection and try again');
 
     if(ok){
       // reset form only on success — keep the user's input if the save failed
