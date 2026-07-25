@@ -964,8 +964,18 @@
   //    https://<your-database-name>-XXXX.restdb.io/rest/civicreports
   // 3. Get an API key: Settings → API → click "Add API Key" (read+write access to the
   //    civicreports collection). Paste both values below.
+  // 4. IMPORTANT — restdb.io's free tier allows only 1 request/second for the whole
+  //    database. To stay under that, manually create ONE document in the civicreports
+  //    collection right now (in the restdb.io data browser, click "Insert"):
+  //      storeKey: tickets_all
+  //      tickets:  []
+  //    Save it, open it, copy its _id from the URL/detail view, and paste it into
+  //    RESTDB_DOC_ID below. This lets every read/write hit that document directly
+  //    (1 request) instead of looking it up first (2-3 requests) — which is what was
+  //    tripping the rate limit on nearly every click.
   const RESTDB_BASE_URL = 'https://civicsense-731b.restdb.io/rest/civicreports';
   const RESTDB_API_KEY  = '6a64c2a49a02a247b86e1d3a';
+  const RESTDB_DOC_ID   = ''; // <-- paste the _id of your manually-created document here (strongly recommended)
   const RESTDB_CONFIGURED = RESTDB_BASE_URL.indexOf('REPLACE-WITH') === -1 && RESTDB_API_KEY.indexOf('REPLACE-WITH') === -1;
   const RESTDB_STORE_KEY = 'tickets_all';
   const RESTDB_DOC_ID_CACHE_KEY = 'civic_report_restdb_doc_id';
@@ -979,8 +989,11 @@
 
   // Cache the restdb.io _id of the one document holding the full ticket list — persisted
   // across page loads so we don't have to re-run the (heavier) lookup query every time.
-  let sharedDocId = null;
-  try{ sharedDocId = localStorage.getItem(RESTDB_DOC_ID_CACHE_KEY) || null; }catch(e){ /* ignore */ }
+  // A hardcoded RESTDB_DOC_ID always takes priority over the cache/lookup.
+  let sharedDocId = RESTDB_DOC_ID || null;
+  if(!sharedDocId){
+    try{ sharedDocId = localStorage.getItem(RESTDB_DOC_ID_CACHE_KEY) || null; }catch(e){ /* ignore */ }
+  }
   function setSharedDocId(id){
     sharedDocId = id;
     try{ localStorage.setItem(RESTDB_DOC_ID_CACHE_KEY, id); }catch(e){ /* ignore */ }
