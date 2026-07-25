@@ -968,13 +968,38 @@
   const RESTDB_API_KEY  = '6a64c2a49a02a247b86e1d3a';
   const RESTDB_CONFIGURED = RESTDB_BASE_URL.indexOf('REPLACE-WITH') === -1 && RESTDB_API_KEY.indexOf('REPLACE-WITH') === -1;
   const RESTDB_STORE_KEY = 'tickets_all';
-  const restdbHeaders = { 'x-apikey': RESTDB_API_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' };
+  const RESTDB_DOC_ID_CACHE_KEY = 'civic_report_restdb_doc_id';
+  // Write requests (POST/PUT) send JSON, which always triggers a CORS preflight regardless
+  // of how the key is passed — so those keep the header for clarity. Read requests (GET) skip
+  // the x-apikey header entirely and pass the key as a query param instead, which keeps them
+  // as CORS "simple requests" with no preflight — roughly halving the request count from
+  // polling, which is what was tripping restdb.io's rate limit.
+  const restdbWriteHeaders = { 'x-apikey': RESTDB_API_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' };
+  function withKey(url){ return url + (url.indexOf('?') > -1 ? '&' : '?') + 'apikey=' + encodeURIComponent(RESTDB_API_KEY); }
 
-  let sharedDocId = null; // caches the restdb.io _id of the one document holding the full ticket list
+  // Cache the restdb.io _id of the one document holding the full ticket list — persisted
+  // across page loads so we don't have to re-run the (heavier) lookup query every time.
+  let sharedDocId = null;
+  try{ sharedDocId = localStorage.getItem(RESTDB_DOC_ID_CACHE_KEY) || null; }catch(e){ /* ignore */ }
+  function setSharedDocId(id){
+    sharedDocId = id;
+    try{ localStorage.setItem(RESTDB_DOC_ID_CACHE_KEY, id); }catch(e){ /* ignore */ }
+  }
+
+  // 429 backoff — if restdb.io rate-limits us, stop hitting it for a while instead of
+  // hammering it every poll (which only makes the rate limit worse).
+  let rateLimitedUntil = 0;
+  function noteRateLimit(res){
+    const retryAfter = res && res.headers && res.headers.get ? parseInt(res.headers.get('Retry-After') || '', 10) : NaN;
+    const waitMs = isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 30000;
+    rateLimitedUntil = Date.now() + waitMs;
+  }
+  function isRateLimited(){ return Date.now() < rateLimitedUntil; }
 
   async function restdbFindStoreDoc(){
     const q = encodeURIComponent(JSON.stringify({ storeKey: RESTDB_STORE_KEY }));
-    const res = await fetch(RESTDB_BASE_URL + '?q=' + q + '&max=1', { headers: restdbHeaders });
+    const res = await fetch(withKey(RESTDB_BASE_URL + '?q=' + q + '&max=1'), { headers: { 'Accept': 'application/json' } });
+    if(res.status === 429){ noteRateLimit(res); throw new Error('rate limited (429) — waiting before retrying'); }
     if(!res.ok) throw new Error('restdb lookup failed: ' + res.status);
     const rows = await res.json();
     return Array.isArray(rows) && rows.length ? rows[0] : null;
@@ -1024,45 +1049,51 @@
 
   async function fetchShared(){
     if(!RESTDB_CONFIGURED){ lastRestdbError = 'not configured'; return []; }
+    if(isRateLimited()){ lastRestdbError = 'rate limited — retrying shortly'; return reports; }
     try{
       let doc = null;
       if(sharedDocId){
-        const res = await fetch(RESTDB_BASE_URL + '/' + sharedDocId, { headers: restdbHeaders });
+        const res = await fetch(withKey(RESTDB_BASE_URL + '/' + sharedDocId), { headers: { 'Accept': 'application/json' } });
+        if(res.status === 429){ noteRateLimit(res); lastRestdbError = 'rate limited (429)'; return reports; }
         if(res.ok) doc = await res.json();
+        else if(res.status === 404) setSharedDocId(''); // stale cached id — fall through to re-lookup
       }
       if(!doc) doc = await restdbFindStoreDoc();
       if(!doc) return [];
-      sharedDocId = doc._id;
+      setSharedDocId(doc._id);
       return Array.isArray(doc.tickets) ? doc.tickets : [];
     }catch(e){
       lastRestdbError = (e && e.message) ? e.message : String(e);
-      return [];
+      return isRateLimited() ? reports : [];
     }
   }
   async function writeShared(list){
     if(!RESTDB_CONFIGURED){ lastRestdbError = 'not configured'; return false; }
+    if(isRateLimited()){ lastRestdbError = 'rate limited — retrying shortly'; return false; }
     try{
       if(!sharedDocId){
         const existing = await restdbFindStoreDoc();
-        if(existing) sharedDocId = existing._id;
+        if(existing) setSharedDocId(existing._id);
       }
       if(sharedDocId){
         const res = await fetch(RESTDB_BASE_URL + '/' + sharedDocId, {
           method: 'PUT',
-          headers: restdbHeaders,
+          headers: restdbWriteHeaders,
           body: JSON.stringify({ storeKey: RESTDB_STORE_KEY, tickets: list })
         });
+        if(res.status === 429){ noteRateLimit(res); lastRestdbError = 'rate limited (429) — try again shortly'; return false; }
         if(!res.ok) lastRestdbError = await restdbErrorText(res);
         return res.ok;
       }
       const res = await fetch(RESTDB_BASE_URL, {
         method: 'POST',
-        headers: restdbHeaders,
+        headers: restdbWriteHeaders,
         body: JSON.stringify({ storeKey: RESTDB_STORE_KEY, tickets: list })
       });
+      if(res.status === 429){ noteRateLimit(res); lastRestdbError = 'rate limited (429) — try again shortly'; return false; }
       if(!res.ok){ lastRestdbError = await restdbErrorText(res); return false; }
       const created = await res.json();
-      sharedDocId = created._id;
+      setSharedDocId(created._id);
       return true;
     }catch(e){
       lastRestdbError = (e && e.message) ? e.message : String(e);
@@ -1581,7 +1612,12 @@
   }
   await syncFromStore();
   renderPreviousReports();
-  setInterval(syncFromStore, 5000);
+  // Polling is intentionally light (20s, paused while the tab isn't visible) — restdb.io's
+  // free tier has a fairly low rate limit, and polling every few seconds from every open
+  // tab is what triggers 429s. This still keeps the board reasonably "live" without hammering it.
+  setInterval(function(){
+    if(document.visibilityState === 'visible') syncFromStore();
+  }, 20000);
 })();
 </script>
 
