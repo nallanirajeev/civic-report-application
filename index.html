@@ -591,6 +591,7 @@
     background: var(--glass-bg-soft);
     backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
   }
+  .map-empty[hidden]{ display:none; }
   .map-locate{
     position:absolute; top:12px; right:12px; z-index:470;
     width:38px; height:38px; border-radius:50%;
@@ -957,67 +958,6 @@
 
 <script>
 (async function(){
-  // ---------- restdb.io backend (shared, cross-device store) ----------
-  // 1. Create a free database at https://restdb.io and add a collection named exactly
-  //    "civicreports" (Settings → Collections → New collection).
-  // 2. Get your database's REST base URL — it looks like:
-  //    https://<your-database-name>-XXXX.restdb.io/rest/civicreports
-  // 3. Get an API key: Settings → API → click "Add API Key" (read+write access to the
-  //    civicreports collection). Paste both values below.
-  // 4. IMPORTANT — restdb.io's free tier allows only 1 request/second for the whole
-  //    database. To stay under that, manually create ONE document in the civicreports
-  //    collection right now (in the restdb.io data browser, click "Insert"):
-  //      storeKey: tickets_all
-  //      tickets:  []
-  //    Save it, open it, copy its _id from the URL/detail view, and paste it into
-  //    RESTDB_DOC_ID below. This lets every read/write hit that document directly
-  //    (1 request) instead of looking it up first (2-3 requests) — which is what was
-  //    tripping the rate limit on nearly every click.
-  const RESTDB_BASE_URL = 'https://civicsense-731b.restdb.io/rest/civicreports';
-  const RESTDB_API_KEY  = '6a64c2a49a02a247b86e1d3a';
-  const RESTDB_DOC_ID   = ''; // <-- paste the _id of your manually-created document here (strongly recommended)
-  const RESTDB_CONFIGURED = RESTDB_BASE_URL.indexOf('REPLACE-WITH') === -1 && RESTDB_API_KEY.indexOf('REPLACE-WITH') === -1;
-  const RESTDB_STORE_KEY = 'tickets_all';
-  const RESTDB_DOC_ID_CACHE_KEY = 'civic_report_restdb_doc_id';
-  // Write requests (POST/PUT) send JSON, which always triggers a CORS preflight regardless
-  // of how the key is passed — so those keep the header for clarity. Read requests (GET) skip
-  // the x-apikey header entirely and pass the key as a query param instead, which keeps them
-  // as CORS "simple requests" with no preflight — roughly halving the request count from
-  // polling, which is what was tripping restdb.io's rate limit.
-  const restdbWriteHeaders = { 'x-apikey': RESTDB_API_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' };
-  function withKey(url){ return url + (url.indexOf('?') > -1 ? '&' : '?') + 'apikey=' + encodeURIComponent(RESTDB_API_KEY); }
-
-  // Cache the restdb.io _id of the one document holding the full ticket list — persisted
-  // across page loads so we don't have to re-run the (heavier) lookup query every time.
-  // A hardcoded RESTDB_DOC_ID always takes priority over the cache/lookup.
-  let sharedDocId = RESTDB_DOC_ID || null;
-  if(!sharedDocId){
-    try{ sharedDocId = localStorage.getItem(RESTDB_DOC_ID_CACHE_KEY) || null; }catch(e){ /* ignore */ }
-  }
-  function setSharedDocId(id){
-    sharedDocId = id;
-    try{ localStorage.setItem(RESTDB_DOC_ID_CACHE_KEY, id); }catch(e){ /* ignore */ }
-  }
-
-  // 429 backoff — if restdb.io rate-limits us, stop hitting it for a while instead of
-  // hammering it every poll (which only makes the rate limit worse).
-  let rateLimitedUntil = 0;
-  function noteRateLimit(res){
-    const retryAfter = res && res.headers && res.headers.get ? parseInt(res.headers.get('Retry-After') || '', 10) : NaN;
-    const waitMs = isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 30000;
-    rateLimitedUntil = Date.now() + waitMs;
-  }
-  function isRateLimited(){ return Date.now() < rateLimitedUntil; }
-
-  async function restdbFindStoreDoc(){
-    const q = encodeURIComponent(JSON.stringify({ storeKey: RESTDB_STORE_KEY }));
-    const res = await fetch(withKey(RESTDB_BASE_URL + '?q=' + q + '&max=1'), { headers: { 'Accept': 'application/json' } });
-    if(res.status === 429){ noteRateLimit(res); throw new Error('rate limited (429) — waiting before retrying'); }
-    if(!res.ok) throw new Error('restdb lookup failed: ' + res.status);
-    const rows = await res.json();
-    return Array.isArray(rows) && rows.length ? rows[0] : null;
-  }
-
   const TICKETS_KEY = 'tickets:all';
   const RESOLVED_TTL_MS = 24 * 60 * 60 * 1000;
   let reports = [];
@@ -1026,6 +966,7 @@
   let currentLoc = null;
   let currentFilter = 'All';
   let map, markerLayer;
+  let lastMapLocKey = null; // tracks which located reports the view was last fitted to
 
   const glyphs = {
     'Pothole':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="13" rx="8" ry="5.2"/><path d="M8 11l2 2-1.5 2M13 10l2 2-1 2.5"/></svg>',
@@ -1053,63 +994,25 @@
     }
   }
 
-  // ---------- Shared store (restdb.io — visible to every visitor, not just this browser) ----------
-  let lastRestdbError = '';
-  async function restdbErrorText(res){
-    try{ const body = await res.text(); return res.status + ' ' + (body ? body.slice(0, 200) : res.statusText); }
-    catch(e){ return String(res.status); }
-  }
-
+  // ---------- Shared store ----------
+  // Note: this uses window.storage — the real Claude-artifact API when running inside
+  // Claude.ai, or the localStorage-backed shim (defined in the earlier <script> block)
+  // when opened standalone. Either way it's per-browser only, not synced across devices —
+  // that's the tradeoff for not depending on an external service with its own rate limits.
   async function fetchShared(){
-    if(!RESTDB_CONFIGURED){ lastRestdbError = 'not configured'; return []; }
-    if(isRateLimited()){ lastRestdbError = 'rate limited — retrying shortly'; return reports; }
     try{
-      let doc = null;
-      if(sharedDocId){
-        const res = await fetch(withKey(RESTDB_BASE_URL + '/' + sharedDocId), { headers: { 'Accept': 'application/json' } });
-        if(res.status === 429){ noteRateLimit(res); lastRestdbError = 'rate limited (429)'; return reports; }
-        if(res.ok) doc = await res.json();
-        else if(res.status === 404) setSharedDocId(''); // stale cached id — fall through to re-lookup
-      }
-      if(!doc) doc = await restdbFindStoreDoc();
-      if(!doc) return [];
-      setSharedDocId(doc._id);
-      return Array.isArray(doc.tickets) ? doc.tickets : [];
+      const res = await window.storage.get(TICKETS_KEY, true);
+      const list = JSON.parse(res.value);
+      return Array.isArray(list) ? list : [];
     }catch(e){
-      lastRestdbError = (e && e.message) ? e.message : String(e);
-      return isRateLimited() ? reports : [];
+      return [];
     }
   }
   async function writeShared(list){
-    if(!RESTDB_CONFIGURED){ lastRestdbError = 'not configured'; return false; }
-    if(isRateLimited()){ lastRestdbError = 'rate limited — retrying shortly'; return false; }
     try{
-      if(!sharedDocId){
-        const existing = await restdbFindStoreDoc();
-        if(existing) setSharedDocId(existing._id);
-      }
-      if(sharedDocId){
-        const res = await fetch(RESTDB_BASE_URL + '/' + sharedDocId, {
-          method: 'PUT',
-          headers: restdbWriteHeaders,
-          body: JSON.stringify({ storeKey: RESTDB_STORE_KEY, tickets: list })
-        });
-        if(res.status === 429){ noteRateLimit(res); lastRestdbError = 'rate limited (429) — try again shortly'; return false; }
-        if(!res.ok) lastRestdbError = await restdbErrorText(res);
-        return res.ok;
-      }
-      const res = await fetch(RESTDB_BASE_URL, {
-        method: 'POST',
-        headers: restdbWriteHeaders,
-        body: JSON.stringify({ storeKey: RESTDB_STORE_KEY, tickets: list })
-      });
-      if(res.status === 429){ noteRateLimit(res); lastRestdbError = 'rate limited (429) — try again shortly'; return false; }
-      if(!res.ok){ lastRestdbError = await restdbErrorText(res); return false; }
-      const created = await res.json();
-      setSharedDocId(created._id);
-      return true;
+      const res = await window.storage.set(TICKETS_KEY, JSON.stringify(list), true);
+      return !!res;
     }catch(e){
-      lastRestdbError = (e && e.message) ? e.message : String(e);
       return false;
     }
   }
@@ -1217,6 +1120,27 @@
     renderBoard();
     updateNextTicketPreview();
     if(map) renderMap();
+  }
+
+  async function setTicketLocation(id){
+    if(!navigator.geolocation){
+      toast('Geolocation not supported on this device');
+      return;
+    }
+    toast('Locating…');
+    navigator.geolocation.getCurrentPosition(
+      async (pos)=>{
+        const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        const ok = await withLock(id, () => mutateTicket(id, function(t){ t.loc = loc; return t; }, { requireOwner: true }));
+        renderStats();
+        renderBoard();
+        renderPreviousReports();
+        if(map) renderMap();
+        toast(ok ? 'Location added — check the map' : 'Could not save location');
+      },
+      ()=>{ toast('Could not get your location'); },
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
   }
 
   async function toggleUpvote(id){
@@ -1329,12 +1253,7 @@
   // ---------- Location ----------
   const locBtn = document.getElementById('locBtn');
   const locReadout = document.getElementById('locReadout');
-  locBtn.addEventListener('click', ()=>{
-    if(!navigator.geolocation){
-      locReadout.textContent = 'Geolocation not supported on this device';
-      return;
-    }
-    locReadout.textContent = 'Locating…';
+  function requestLocation(opts, isRetry){
     navigator.geolocation.getCurrentPosition(
       (pos)=>{
         currentLoc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
@@ -1342,11 +1261,29 @@
         locReadout.classList.add('set');
       },
       (err)=>{
+        // The very first click often burns most of the timeout just on the browser's
+        // permission prompt, before any GPS/network fix can happen — so a timeout on
+        // that first attempt doesn't mean location is unavailable. Retry once
+        // automatically with a longer timeout and relaxed accuracy instead of making
+        // the person click the button a second time themselves.
+        if(!isRetry && err.code === err.TIMEOUT){
+          locReadout.textContent = 'Still locating…';
+          requestLocation({ enableHighAccuracy: false, timeout: 15000, maximumAge: 60000 }, true);
+          return;
+        }
         locReadout.textContent = 'Could not get location — you can still file without it';
         locReadout.classList.remove('set');
       },
-      { enableHighAccuracy: true, timeout: 8000 }
+      opts
     );
+  }
+  locBtn.addEventListener('click', ()=>{
+    if(!navigator.geolocation){
+      locReadout.textContent = 'Geolocation not supported on this device';
+      return;
+    }
+    locReadout.textContent = 'Locating…';
+    requestLocation({ enableHighAccuracy: true, timeout: 10000 }, false);
   });
 
   // ---------- Submit ----------
@@ -1393,7 +1330,7 @@
     const ok = await writeShared(list);
     if(ok) reports = list;
 
-    toast(ok ? 'Filed ' + ticketId(nextNum) : 'Could not file — ' + (lastRestdbError || 'check your connection and try again'));
+    toast(ok ? 'Filed ' + ticketId(nextNum) : 'Could not file — check your connection and try again');
 
     if(ok){
       // reset form only on success — keep the user's input if the save failed
@@ -1497,6 +1434,7 @@
         actions = '<select class="status-select" data-id="'+r.id+'" aria-label="Change status for '+ticketId(r.num)+'">'
           + STEPS.map(s=>'<option value="'+s+'"'+(s===r.status?' selected':'')+'>'+s+'</option>').join('')
           + '</select>'
+          + (!r.loc ? '<button data-id="'+r.id+'" data-action="set-location">Pin location</button>' : '')
           + '<button class="danger" data-id="'+r.id+'" data-action="delete">Delete</button>';
       } else {
         const upvoted = Array.isArray(r.upvotes) && r.upvotes.indexOf(myId) !== -1;
@@ -1538,6 +1476,7 @@
         if(action === 'upvote') await toggleUpvote(id);
         if(action === 'confirm-fixed') await confirmResolved(id);
         if(action === 'reopen') await reopenTicket(id);
+        if(action === 'set-location') await setTicketLocation(id);
       });
     });
     container.querySelectorAll('select.status-select').forEach(sel=>{
@@ -1566,6 +1505,7 @@
           + '<span class="prev-age">'+timeAgo(r.createdAt)+'</span>'
           + '<span class="prev-actions">'
           + '<button type="button" data-action="view-board" data-id="'+r.id+'">View</button>'
+          + (!r.loc ? '<button type="button" data-action="set-location" data-id="'+r.id+'">Pin location</button>' : '')
           + '<button type="button" class="danger" data-action="delete" data-id="'+r.id+'">Delete</button>'
           + '</span></div>';
       }).join('')
@@ -1575,6 +1515,7 @@
         const action = btn.dataset.action;
         if(action === 'view-board') document.getElementById('tab-board').click();
         if(action === 'delete') await deleteTicket(btn.dataset.id);
+        if(action === 'set-location') await setTicketLocation(btn.dataset.id);
       });
     });
   }
@@ -1589,7 +1530,7 @@
   function renderMap(){
     const withLoc = reports.filter(r=>r.loc);
     const emptyEl = document.getElementById('mapEmpty');
-    if(emptyEl) emptyEl.hidden = reports.length > 0;
+    if(emptyEl) emptyEl.hidden = withLoc.length > 0;
     if(!map){
       const center = withLoc.length ? [withLoc[0].loc.lat, withLoc[0].loc.lng] : [20, 0];
       map = L.map('map').setView(center, withLoc.length ? 14 : 2);
@@ -1598,6 +1539,7 @@
         maxZoom: 19
       }).addTo(map);
       markerLayer = L.layerGroup().addTo(map);
+      setTimeout(()=>map && map.invalidateSize(), 0);
     }
     markerLayer.clearLayers();
     const colors = { 'Pending':'#A93B3B', 'In Progress':'#F7B733', 'Resolved':'#2D6A4F' };
@@ -1612,25 +1554,27 @@
       );
       marker.addTo(markerLayer);
     });
-    if(withLoc.length){
-      const group = new L.featureGroup(markerLayer.getLayers());
-      if(withLoc.length > 1) map.fitBounds(group.getBounds().pad(0.3));
+    // Only re-fit the view when the set of located reports actually changed (a pin was
+    // added/removed/moved) — not on every 5s poll — so the user's manual zoom/pan isn't
+    // reset repeatedly, and a single located ticket is zoomed to correctly instead of
+    // being left on the default world view.
+    const locKey = withLoc.map(r=>r.id+':'+r.loc.lat+','+r.loc.lng).sort().join('|');
+    if(withLoc.length && locKey !== lastMapLocKey){
+      if(withLoc.length > 1){
+        const group = new L.featureGroup(markerLayer.getLayers());
+        map.fitBounds(group.getBounds().pad(0.3));
+      } else {
+        map.setView([withLoc[0].loc.lat, withLoc[0].loc.lng], 15);
+      }
     }
+    lastMapLocKey = locKey;
   }
 
   // ---------- Init + real-time polling ----------
   await ensureIdentity();
-  if(!RESTDB_CONFIGURED){
-    toast('restdb.io not configured — add your database URL + API key in the script');
-  }
   await syncFromStore();
   renderPreviousReports();
-  // Polling is intentionally light (20s, paused while the tab isn't visible) — restdb.io's
-  // free tier has a fairly low rate limit, and polling every few seconds from every open
-  // tab is what triggers 429s. This still keeps the board reasonably "live" without hammering it.
-  setInterval(function(){
-    if(document.visibilityState === 'visible') syncFromStore();
-  }, 20000);
+  setInterval(syncFromStore, 5000);
 })();
 </script>
 
